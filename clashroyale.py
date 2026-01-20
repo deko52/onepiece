@@ -1,16 +1,16 @@
 import asyncio
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import Command
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-TOKEN = "8402739187:AAHzABjYMj0G0hd-Ww7zGLiNHAbx9H6dNVo"  # Вставь свой токен
+TOKEN = "8402739187:AAHzABjYMj0G0hd-Ww7zGLiNHAbx9H6dNVo"
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# --- Простая база данных для беты (в памяти)
-players = {}  # user_id: данные
+# --- База данных для беты
+players = {}  # user_id: данные игрока
 pvp_queue = []  # очередь игроков на PvP
-ongoing_matches = {}  # match_id: данные матча
+ongoing_matches = {}  # активные матчи
 
 # --- Мини-колода для теста
 cards = {
@@ -20,51 +20,75 @@ cards = {
     "Усопп": {"rarity": "Обычная", "atk": 120, "def": 120},
 }
 
-# --- Главное меню
-def main_menu(user_name):
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("Мои карты 🃏", callback_data="my_cards"),
-        InlineKeyboardButton("Сыграть PvP ⚔️", callback_data="play_pvp"),
-        InlineKeyboardButton("Баланс 💰", callback_data="balance"),
-        InlineKeyboardButton("Пак/Открыть пак 🎁", callback_data="packs")
+# --- Главное меню (с inline_keyboard)
+def main_menu():
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Мои карты 🃏", callback_data="my_cards"),
+                InlineKeyboardButton(text="Сыграть PvP ⚔️", callback_data="play_pvp")
+            ],
+            [
+                InlineKeyboardButton(text="Баланс 💰", callback_data="balance"),
+                InlineKeyboardButton(text="Пак/Открыть пак 🎁", callback_data="packs")
+            ]
+        ]
     )
     return keyboard
 
-# --- Команда /start
+# --- /start
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     players.setdefault(message.from_user.id, {"coins": 0, "wins": 0, "losses": 0, "timeout": 0})
     await message.answer(
         f"Привет, {message.from_user.first_name}! 👋\nВыберите действие:",
-        reply_markup=main_menu(message.from_user.first_name)
+        reply_markup=main_menu()
     )
 
-# --- Обработка кнопок главного меню
+# --- Обработка всех callback
 @dp.callback_query()
-async def handle_menu(callback_query: types.CallbackQuery):
+async def handle_callback(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
-    action = callback_query.data
+    data = callback_query.data
 
     if user_id not in players:
         players[user_id] = {"coins": 0, "wins": 0, "losses": 0, "timeout": 0}
 
-    if action == "my_cards":
+    # --- PvP выбор карты
+    if "|" in data:
+        match_id, card_name = data.split("|")
+        match = ongoing_matches.get(match_id)
+        if match is None:
+            await callback_query.answer("Матч уже завершён")
+            return
+        if user_id not in match["choices"]:
+            match["choices"][user_id] = []
+        if card_name not in match["choices"][user_id]:
+            match["choices"][user_id].append(card_name)
+        await callback_query.answer(f"Вы выбрали: {card_name}")
+
+        if all(len(match["choices"].get(pid, [])) == 2 for pid in match["players"]):
+            await resolve_round(match_id)
+        return
+
+    # --- Главное меню
+    if data == "my_cards":
         msg = "Ваши карты:\n"
-        for name, data in cards.items():
-            msg += f"{name} | {data['rarity']} | ATK: {data['atk']} | DEF: {data['def']}\n"
+        for name, info in cards.items():
+            msg += f"{name} | {info['rarity']} | ATK: {info['atk']} | DEF: {info['def']}\n"
         await bot.send_message(user_id, msg)
-    elif action == "balance":
-        coins = players[user_id]["coins"]
-        wins = players[user_id]["wins"]
-        losses = players[user_id]["losses"]
-        await bot.send_message(user_id, f"Монеты: {coins}\nПобеды: {wins}\nПоражения: {losses}")
-    elif action == "packs":
+
+    elif data == "balance":
+        info = players[user_id]
+        await bot.send_message(user_id, f"Монеты: {info['coins']}\nПобеды: {info['wins']}\nПоражения: {info['losses']}")
+
+    elif data == "packs":
         await bot.send_message(user_id, "Паки пока в разработке 😉")
-    elif action == "play_pvp":
+
+    elif data == "play_pvp":
         await start_pvp(user_id)
 
-# --- Функция начала PvP
+# --- PvP
 async def start_pvp(user_id):
     if players[user_id]["timeout"] > 0:
         await bot.send_message(user_id, f"Вы заблокированы {players[user_id]['timeout']} сек.")
@@ -86,7 +110,7 @@ async def start_pvp(user_id):
         }
         await start_round(match_id)
 
-# --- Старт раунда
+# --- Раунд
 async def start_round(match_id):
     match = ongoing_matches[match_id]
     round_num = match["round"]
@@ -94,47 +118,26 @@ async def start_round(match_id):
         await send_card_choices(player_id, match_id, round_num)
     asyncio.create_task(round_timer(match_id, 90))
 
-# --- Выбор карт игроком
 async def send_card_choices(player_id, match_id, round_num):
-    keyboard = InlineKeyboardMarkup()
-    for name in cards.keys():
-        keyboard.add(InlineKeyboardButton(name, callback_data=f"{match_id}|{name}"))
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=name, callback_data=f"{match_id}|{name}")] for name in cards.keys()
+        ]
+    )
     await bot.send_message(player_id, f"Раунд {round_num}/3. Выберите 2 карты:", reply_markup=keyboard)
 
-# --- Таймер 90 секунд на ход
+# --- Таймер
 async def round_timer(match_id, seconds):
     await asyncio.sleep(seconds)
     match = ongoing_matches.get(match_id)
     if match is None:
         return
-    for player_id in match["players"]:
-        if player_id not in match["choices"]:
+    for pid in match["players"]:
+        if pid not in match["choices"]:
             selected = list(cards.keys())[:2]
-            match["choices"][player_id] = selected
-            await bot.send_message(player_id, f"Вы не выбрали карты вовремя. Автовыбор: {', '.join(selected)}")
+            match["choices"][pid] = selected
+            await bot.send_message(pid, f"Автовыбор карт: {', '.join(selected)}")
     await resolve_round(match_id)
-
-# --- Обработка выбора карты
-@dp.callback_query()
-async def process_card_choice(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if "|" not in callback_query.data:
-        return  # пропускаем кнопки главного меню
-    match_id, card_name = callback_query.data.split("|")
-    match = ongoing_matches.get(match_id)
-    if match is None:
-        await callback_query.answer("Матч уже завершён")
-        return
-
-    if user_id not in match["choices"]:
-        match["choices"][user_id] = []
-    if card_name not in match["choices"][user_id]:
-        match["choices"][user_id].append(card_name)
-
-    await callback_query.answer(f"Вы выбрали: {card_name}")
-
-    if all(len(match["choices"].get(pid, [])) == 2 for pid in match["players"]):
-        await resolve_round(match_id)
 
 # --- Разрешение раунда
 async def resolve_round(match_id):
@@ -166,9 +169,8 @@ async def resolve_round(match_id):
 
     for pid in match["players"]:
         await bot.send_message(pid, result_msg)
-        await bot.send_message(pid, "Возврат в главное меню:", reply_markup=main_menu("Игрок"))
+        await bot.send_message(pid, "Возврат в главное меню:", reply_markup=main_menu())
 
-    # Подготовка к следующему раунду
     match["round"] += 1
     match["choices"] = {}
     if match["round"] > 3:
@@ -176,6 +178,6 @@ async def resolve_round(match_id):
     else:
         await start_round(match_id)
 
-# --- Запуск бота
+# --- Запуск
 if __name__ == "__main__":
-    asyncio.run(dp.start_polling(bot))
+    asyncio.run(dp.start_polling(bot, skip_updates=True))
